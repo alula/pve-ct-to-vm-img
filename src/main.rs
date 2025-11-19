@@ -115,16 +115,26 @@ fn main() -> Result<()> {
     let lb_size = LogicalBlockSize::try_from(args.lba)
         .context("Unsupported LBA size (must be 512 or 4096)")?;
 
-    // Create a new GPT configuration
-    let gpt_config = GptConfig::new().writable(true).logical_block_size(lb_size);
-
-    let mut disk = gpt_config
+    // Open the output file for reading and writing
+    let mut output_file_for_gpt = OpenOptions::new()
+        .read(true)
+        .write(true)
         .open(&args.output)
-        .context("Failed to open output for GPT")?;
+        .context("Failed to open output file for GPT")?;
 
-    // Initialize a new header
-    disk.update_partitions(std::collections::BTreeMap::new())
-        .context("Failed to initialize GPT header")?;
+    // Create a protective MBR at LBA0
+    let mbr = gpt::mbr::ProtectiveMBR::with_lb_size(
+        u32::try_from((total_bytes / args.lba) - 1).unwrap_or(0xFF_FF_FF_FF)
+    );
+    mbr.overwrite_lba0(&mut output_file_for_gpt)
+        .context("Failed to write protective MBR")?;
+
+    // Create a new GPT from the device
+    let mut disk = GptConfig::default()
+        .writable(true)
+        .logical_block_size(lb_size)
+        .create_from_device(Box::new(output_file_for_gpt), None)
+        .context("Failed to create GPT disk")?;
 
     // Define Data Partition Geometry
     // It always starts after the padding
@@ -215,7 +225,8 @@ fn main() -> Result<()> {
             .context("Failed to update partitions")?;
     }
 
-    disk.write()
+    // Write the partition table and get back the underlying file handle
+    let output_file_after_gpt = disk.write()
         .context("Failed to write GPT changes to disk")?;
 
     if let Some((esp_start_lba, esp_size_bytes)) = esp_region {
@@ -233,7 +244,7 @@ fn main() -> Result<()> {
     println!("Copying filesystem image to offset...");
 
     let mut reader = BufReader::new(input_file);
-    let mut writer = BufWriter::new(output_file);
+    let mut writer = BufWriter::new(output_file_after_gpt);
 
     // Seek output to the start of the data partition
     writer
